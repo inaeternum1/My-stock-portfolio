@@ -1,44 +1,46 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+import altair as alt  # 🚨 차트 디자인을 완벽하게 제어하기 위해 추가!
 
-st.set_page_config(page_title="실시간 주식 관리자", page_icon="💰", layout="wide")
+# 페이지 설정
+st.set_page_config(page_title="내 주식 현황", page_icon="💰", layout="wide")
 
-st.title("📊 주식 포트폴리오 대시보드")
-st.markdown("친구가 공유받을 내 주식 현황입니다.")
+# --- 🎨 화면 디자인 수정: 메트릭(숫자) 글자 크기 줄이기 ---
+st.markdown("""
+<style>
+/* 숫자 크기 조절 */
+[data-testid="stMetricValue"] {
+    font-size: 24px !important;
+}
+/* 제목 글자 크기 조절 */
+[data-testid="stMetricLabel"] {
+    font-size: 16px !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
-if 'portfolio' not in st.session_state:
-    st.session_state.portfolio = []
+# --- 🔄 타이틀과 새로고침 버튼을 같은 줄에 배치 ---
+col_title, col_btn = st.columns([4, 1])
+with col_title:
+    st.title("📊 내 주식 포트폴리오")
+with col_btn:
+    st.write("") 
+    st.write("")
+    if st.button("🔄 시세 새로고침", use_container_width=True):
+        st.cache_data.clear() 
+        st.rerun() 
 
-@st.cache_data(ttl=60)
-def get_stock_info(ticker):
-    ticker = str(ticker).strip().upper()
-    
-    # 6자리 숫자로만 입력했다면 자동으로 .KS(코스피) 붙여주기
-    if ticker.isdigit() and len(ticker) == 6:
-        ticker += ".KS"
-        
-    try:
-        # 에러 메시지 해결! 억지로 세션을 만들지 않고 yfinance 자체 기능에 온전히 맡김
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="5d")
-        
-        if hist.empty:
-            return {"price": 0.0, "change": 0.0, "error": "데이터 없음(종목코드 오류 또는 상장폐지)"}
-            
-        current_price = hist['Close'].iloc[-1]
-        
-        if len(hist) >= 2:
-            prev_close = hist['Close'].iloc[-2]
-            daily_change = ((current_price - prev_close) / prev_close) * 100
-        else:
-            daily_change = 0.0
-            
-        return {"price": current_price, "change": daily_change, "error": None}
-        
-    except Exception as e:
-        return {"price": 0.0, "change": 0.0, "error": f"통신 에러: {str(e)}"}
+st.markdown("친구야, 내 피땀눈물이 담긴 계좌다. (실시간 시세 & 환율 자동 반영 중 💸)")
 
+# 1. 고정 데이터 (삼성전자, 앱셀레라)
+portfolio = [
+    {"종목명": "삼성전자", "티커": "005930.KS", "평단가": 160500, "주식수": 177, "통화": "KRW"},
+    {"종목명": "앱셀레라", "티커": "ABCL", "평단가": 3.40, "주식수": 3000, "통화": "USD"}
+]
+df = pd.DataFrame(portfolio)
+
+# 실시간 환율 가져오기
 @st.cache_data(ttl=3600)
 def get_exchange_rate():
     try:
@@ -48,83 +50,129 @@ def get_exchange_rate():
 
 rate = get_exchange_rate()
 
-# --- 1. 입력 섹션 ---
-with st.expander("➕ 새 종목 추가하기", expanded=True):
-    with st.form("add_form", clear_on_submit=True):
-        c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 1])
-        with c1: name = st.text_input("종목명", placeholder="예: 삼성전자")
-        with c2: ticker_input = st.text_input("티커/종목번호", placeholder="005930 또는 ABCL")
-        with c3: avg_price = st.number_input("내 평단가", min_value=0.0, step=1.0)
-        with c4: count = st.number_input("주식 수", min_value=0.0, step=1.0)
-        with c5: currency = st.selectbox("통화", ["KRW", "USD"])
-        
-        if st.form_submit_button("추가하기") and ticker_input:
-            st.session_state.portfolio.append({
-                "종목명": name if name else ticker_input,
-                "티커": ticker_input,
-                "평단가": avg_price,
-                "주식수": count,
-                "통화": currency
-            })
-            st.rerun()
+# 2. 실시간 데이터 & 과거 3개월 데이터(그래프용) 가져오기
+@st.cache_data(ttl=60)
+def fetch_market_data(tickers):
+    data_dict = {}
+    history_dict = {}
+    for ticker in tickers:
+        try:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(period="3mo")
+            if not hist.empty:
+                data_dict[ticker] = hist['Close'].iloc[-1] 
+                history_dict[ticker] = hist['Close'] 
+            else:
+                data_dict[ticker] = 0
+                history_dict[ticker] = pd.Series(dtype=float)
+        except:
+            data_dict[ticker] = 0
+            history_dict[ticker] = pd.Series(dtype=float)
+    return data_dict, history_dict
 
-# --- 2. 데이터 처리 ---
-if st.session_state.portfolio:
-    df = pd.DataFrame(st.session_state.portfolio)
+with st.spinner('최신 시세와 차트 그리는 중... 🚀'):
+    current_prices, historical_prices = fetch_market_data(df['티커'].tolist())
+
+df['현재가'] = df['티커'].map(current_prices)
+
+# 3. 현재 계좌 가치 계산 (환율 적용)
+def calc_current(row):
+    ex_rate = rate if row['통화'] == 'USD' else 1
     
-    with st.spinner('실시간 시장 데이터 긁어오는 중...'):
-        current_data = [get_stock_info(t) for t in df['티커']]
-        
-    for i, data in enumerate(current_data):
-        if data['error']:
-            st.error(f"⚠️ '{df['종목명'].iloc[i]}' 데이터 수신 실패! 사유: {data['error']}")
-            
-    df['현재가'] = [d['price'] for d in current_data]
-    df['오늘등락률'] = [d['change'] for d in current_data]
-
-    def calculate_values(row):
-        is_usd = row['통화'] == 'USD'
-        ex_rate = rate if is_usd else 1
-        
-        buy_total = row['평단가'] * row['주식수'] * ex_rate
-        cur_total = row['현재가'] * row['주식수'] * ex_rate
-        profit = cur_total - buy_total
-        profit_rate = (profit / buy_total * 100) if buy_total > 0 else 0
-        
-        return pd.Series([buy_total, cur_total, profit, profit_rate])
-
-    df[['매수금액', '평가금액', '수익금', '수익률']] = df.apply(calculate_values, axis=1)
-
-    # --- 3. 대시보드 ---
-    total_buy = df['매수금액'].sum()
-    total_eval = df['평가금액'].sum()
-    total_profit = total_eval - total_buy
-    total_rate = (total_profit / total_buy * 100) if total_buy > 0 else 0
-
-    st.subheader("💰 전체 계좌 요약")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("총 매수금액", f"{total_buy:,.0f}원")
-    m2.metric("총 평가금액", f"{total_eval:,.0f}원")
-    m3.metric("총 수익금", f"{total_profit:,.0f}원")
-    m4.metric("총 수익률", f"{total_rate:.2f}%")
-
-    st.divider()
-
-    def color_val(val):
-        return f"color: {'red' if val > 0 else 'blue' if val < 0 else 'black'}"
-
-    st.subheader("📝 보유 종목 상세 내역")
+    buy_total = row['평단가'] * row['주식수'] * ex_rate
+    cur_total = row['현재가'] * row['주식수'] * ex_rate
+    profit = cur_total - buy_total
+    profit_rate = (profit / buy_total * 100) if buy_total > 0 else 0
     
-    display_df = df[['종목명', '티커', '평단가', '현재가', '주식수', '오늘등락률', '수익률', '수익금']].copy()
-    
-    st.dataframe(display_df.style.format({
-        '평단가': '{:,.2f}', '현재가': '{:,.2f}', '주식수': '{:,.0f}',
-        '오늘등락률': '{:+.2f}%', '수익률': '{:+.2f}%', '수익금': '{:,.0f}원'
-    }).map(color_val, subset=['오늘등락률', '수익률']), use_container_width=True)
+    return pd.Series([buy_total, cur_total, profit, profit_rate])
 
-    if st.button("🗑️ 리스트 완벽 초기화"):
-        st.session_state.portfolio = []
-        st.cache_data.clear()
-        st.rerun()
+df[['매수금액(원)', '평가금액(원)', '수익금(원)', '수익률(%)']] = df.apply(calc_current, axis=1)
+
+total_buy = df['매수금액(원)'].sum()
+total_eval = df['평가금액(원)'].sum()
+total_profit = total_eval - total_buy
+total_rate = (total_profit / total_buy * 100) if total_buy > 0 else 0
+
+# 4. 상단 요약 대시보드 (빨강/파랑 색상 적용)
+st.subheader("💰 전체 계좌 요약")
+
+t_color = "#ff4b4b" if total_profit > 0 else "#1e88e5" if total_profit < 0 else "black"
+t_sign = "+" if total_profit > 0 else ""
+
+col1, col2, col3, col4 = st.columns(4)
+
+col1.markdown(f"<div style='font-size:14px; color:gray;'>총 매수금액</div><div style='font-size:22px; font-weight:bold;'>{total_buy:,.0f}원</div>", unsafe_allow_html=True)
+col2.markdown(f"<div style='font-size:14px; color:gray;'>총 평가금액</div><div style='font-size:22px; font-weight:bold;'>{total_eval:,.0f}원</div>", unsafe_allow_html=True)
+col3.markdown(f"<div style='font-size:14px; color:gray;'>총 수익금</div><div style='font-size:22px; font-weight:bold; color:{t_color};'>{t_sign}{total_profit:,.0f}원</div>", unsafe_allow_html=True)
+col4.markdown(f"<div style='font-size:14px; color:gray;'>총 수익률</div><div style='font-size:22px; font-weight:bold; color:{t_color};'>{t_sign}{total_rate:.2f}%</div>", unsafe_allow_html=True)
+
+st.divider()
+
+# 5. 수익률 꺾은선 그래프 (3개월) - Altair로 업그레이드!
+st.subheader("📈 최근 3개월 내 계좌 총 수익률 흐름")
+
+chart_df = pd.DataFrame()
+
+for idx, row in df.iterrows():
+    ticker = row['티커']
+    qty = row['주식수']
+    ex_rate = rate if row['통화'] == 'USD' else 1
+    
+    if ticker in historical_prices and not historical_prices[ticker].empty:
+        daily_value = historical_prices[ticker] * qty * ex_rate
+        daily_value.index = daily_value.index.tz_localize(None)
+        chart_df[ticker] = daily_value
+
+if not chart_df.empty:
+    chart_df.ffill(inplace=True)
+    chart_df.bfill(inplace=True)
+    
+    chart_df['총평가금액'] = chart_df.sum(axis=1)
+    chart_df['총수익률(%)'] = ((chart_df['총평가금액'] - total_buy) / total_buy) * 100
+    
+    # Altair 차트를 그리기 위해 인덱스(날짜)를 일반 컬럼으로 꺼냄
+    plot_df = chart_df.reset_index()
+    plot_df.rename(columns={'index': 'Date'}, inplace=True)
+    
+    chart_color = "#ff4b4b" if chart_df['총수익률(%)'].iloc[-1] >= 0 else "#1e88e5"
+    
+    # 🚨 Altair를 이용한 섬세한 차트 설정 (가로 글자 강제 고정, 월/일 포맷)
+    line_chart = alt.Chart(plot_df).mark_line(color=chart_color, strokeWidth=2).encode(
+        x=alt.X('Date:T', 
+                axis=alt.Axis(
+                    title='', 
+                    format='%m월 %d일', # 년도를 빼고 월/일만 표시
+                    labelAngle=0,      # 글자를 세로로 꺾지 말고 무조건 가로(0도)로 유지
+                    tickCount=6        # 가로로 유지되도록 눈금 개수 조절
+                )),
+        y=alt.Y('총수익률(%):Q', axis=alt.Axis(title='수익률 (%)')),
+        tooltip=[
+            alt.Tooltip('Date:T', format='%Y년 %m월 %d일', title='날짜'),
+            alt.Tooltip('총수익률(%):Q', format='+.2f', title='총 수익률(%)')
+        ]
+    ).interactive() # 마우스 드래그 확대/축소 기능 추가
+
+    st.altair_chart(line_chart, use_container_width=True)
 else:
-    st.info("좌측 상단의 '새 종목 추가하기'를 눌러 종목을 입력해 주세요.")
+    st.info("차트를 그릴 데이터가 부족합니다.")
+
+st.divider()
+
+# 6. 상세 종목 내역
+st.subheader("📝 보유 종목 상세 내역")
+def color_val(val):
+    return f"color: {'#ff4b4b' if val > 0 else '#1e88e5' if val < 0 else 'black'}"
+
+display_df = df[['종목명', '티커', '평단가', '현재가', '주식수', '매수금액(원)', '평가금액(원)', '수익금(원)', '수익률(%)']].copy()
+
+st.dataframe(display_df.style.format({
+    '평단가': '{:,.2f}', 
+    '현재가': '{:,.2f}', 
+    '주식수': '{:,.0f}',
+    '매수금액(원)': '{:,.0f}원',
+    '평가금액(원)': '{:,.0f}원',
+    '수익금(원)': '{:,.0f}원',
+    '수익률(%)': '{:+.2f}%'
+}).map(color_val, subset=['수익률(%)', '수익금(원)']), use_container_width=True)
+
+st.caption(f"적용된 실시간 환율: 1 USD = {rate:,.2f} KRW | 데이터 제공: Yahoo Finance")
